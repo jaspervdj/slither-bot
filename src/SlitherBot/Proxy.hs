@@ -17,6 +17,7 @@ import qualified Data.Text.Encoding as T
 
 import           SlitherBot.Ai
 import           SlitherBot.Ai.Search
+import           SlitherBot.Ai.Killer
 import           SlitherBot.Protocol
 import           SlitherBot.GameState
 import           SlitherBot.Prelude
@@ -29,11 +30,11 @@ proxy serverPort = do
   $logInfo ("Starting proxy server on port " ++ tshow serverPort)
   run <- askRunBase
   -- Ref where the ai state is stored
-  aiStateRef :: IORef (Maybe AiState) <- newIORef Nothing
+  aiStateRef :: IORef (Maybe KillerAiState) <- newIORef Nothing
   liftIO $ Warp.run serverPort $ WS.websocketsOr WS.defaultConnectionOptions
     (run . wsApp aiStateRef) (backupApp aiStateRef)
   where
-    ai = searchAi
+    ai = killerAi
 
     wsApp aiStateRef pendingConn = do
       -- Check that nobody else is running

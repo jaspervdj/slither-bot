@@ -21,6 +21,7 @@ library
                      , SlitherBot.Ai
                      , SlitherBot.Ai.Circle
                      , SlitherBot.Ai.Avoid
+                     , SlitherBot.Ai.Killer
                      , SlitherBot.Ai.Search
                      , SlitherBot.UtilityGrid
                      , SlitherBot.Prelude
