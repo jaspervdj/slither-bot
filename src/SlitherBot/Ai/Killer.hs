@@ -5,32 +5,67 @@ module SlitherBot.Ai.Killer
     , killerAi
     ) where
 
-import qualified Data.Foldable        as Foldable
-import qualified Data.HashMap.Strict  as HMS
-import           Data.List            (maximumBy)
-import           Data.Maybe           (maybeToList)
-import           Data.Ord             (comparing)
-import qualified Data.Sequence        as Seq
-import qualified Linear.Metric        as Linear
+import           Control.Monad            (guard)
+import           Data.Fixed               (mod')
+import qualified Data.Foldable            as Foldable
+import qualified Data.HashMap.Strict      as HMS
+import           Data.List                (maximumBy)
+import           Data.Maybe               (maybeToList)
+import           Data.Ord                 (comparing, Down (..))
+import qualified Data.Sequence            as Seq
+import qualified Linear.Metric            as Linear
 import           Linear.V2
 import           SlitherBot.Ai
 import           SlitherBot.GameState
+import           SlitherBot.Protocol
 
 data KillerAiState = KillerAiState
+
+data DirSnake = DirSnake
+    { dsHead :: !(V2 Double)
+    , dsDir  :: !Double
+    } deriving (Show)
 
 lookAheadDistance :: Double
 lookAheadDistance = 400
 
-possibleTurns :: [Double]
-possibleTurns =
+maxTurnAngle :: Double
+maxTurnAngle = pi / 4
+
+foodRadius :: Double
+foodRadius = 400
+
+data TurnStrategy
+    = PlainTurn {tsRelativeTurn :: !Double}
+    | FoodTurn  {tsRelativeTurn :: !Double, tsFood :: !Double}
+    deriving (Eq, Show)
+
+instance Ord TurnStrategy where
+    compare (FoodTurn _ x) (FoodTurn _ y) = compare x y
+    compare (PlainTurn _)  (FoodTurn _ _) = LT
+    compare (FoodTurn _ _) (PlainTurn _)  = GT
+    compare (PlainTurn x)  (PlainTurn y)  =
+        -- Prefer going straight?
+        compare (Down $ abs x) (Down $ abs y)
+
+normalTurns :: [TurnStrategy]
+normalTurns = map PlainTurn $
     turns ++ map negate turns ++ [0]
   where
-    maxTurn  = pi / 2
     numTurns = 3 :: Int
     turns    =
-        [ fromIntegral ix * (maxTurn / fromIntegral numTurns)
+        [ fromIntegral ix * (maxTurnAngle / fromIntegral numTurns)
         | ix <- [1 .. numTurns]
         ]
+
+foodTurns :: DirSnake -> GameState -> [TurnStrategy]
+foodTurns DirSnake {..} GameState {..} = do
+    (foodPos, food) <- HMS.toList gsFoods
+    guard $ Linear.distance dsHead foodPos < foodRadius
+    let turn         = toAngle (foodPos - dsHead)
+        relativeTurn = (turn - dsDir) `mod'` (2 * pi)
+    guard $ -maxTurnAngle <= relativeTurn && relativeTurn <= maxTurnAngle
+    return $ FoodTurn {tsRelativeTurn = relativeTurn, tsFood = foodValue food}
 
 data LineSegment = LineSegment !(V2 Double) !(V2 Double)
     deriving (Show)
@@ -41,6 +76,17 @@ data Box = Box !(V2 Double) !(V2 Double)
 lineSegmentToBox :: LineSegment -> Box
 lineSegmentToBox (LineSegment (V2 x1 y1) (V2 x2 y2)) =
     Box (V2 (min x1 x2) (min y1 y2)) (V2 (max x1 x2) (max y1 y2))
+{-# INLINE lineSegmentToBox #-}
+
+boxIntersection :: Box -> Box -> Bool
+boxIntersection
+        (Box (V2 left1 top1) (V2 right1 bottom1))
+        (Box (V2 left2 top2) (V2 right2 bottom2)) = not $
+    left1   > right2  ||
+    top1    > bottom2 ||
+    right1  < left2   ||
+    bottom1 < top2
+{-# INLINE boxIntersection #-}
 
 (./) :: V2 Double -> Double -> V2 Double
 (V2 x y) ./ s = V2 (x / s) (y / s)
@@ -104,25 +150,19 @@ toAngle (V2 x y) = atan2 y x
 {-# INLINE toAngle #-}
 
 updateKillerAi :: Snake -> GameState -> (AiOutput, KillerAiState)
-updateKillerAi ownSnake GameState{..} = case snakeNeck ownSnake of
-    Nothing                       -> (AiOutput 0 False, KillerAiState)
-    Just (Neck (LineSegment neck head_)) ->
-        let direction    = toAngle (head_ - neck)
-            nextSegments =
-                [ LineSegment head_ (head_ + (angle (direction + turn) .* dist))
-                | turn <- possibleTurns
-                ]
-            withScores   =
-                [ (segment, closestIntersection segment otherSnakeLineSegments)
-                | segment <- nextSegments
+updateKillerAi ownSnake gs@GameState{..} = case makeDirSnake ownSnake of
+    Nothing                      -> (AiOutput 0 False, KillerAiState)
+    Just ds@(DirSnake head_ dir) ->
+        let nextSegments =
+                [ evaluateStrategy turn ds
+                | turn <- normalTurns ++ foodTurns ds gs
                 ] in
 
-        case withScores of
+        case nextSegments of
             [] -> (AiOutput 0 False, KillerAiState)
             _  ->
-                let best = maximumBy (comparing snd) withScores
-                    LineSegment start end = fst best
-                    bestAngle = toAngle (end - start) in
+                let (_score, ts) = maximum nextSegments
+                    bestAngle    = dir + tsRelativeTurn ts in
                 (AiOutput bestAngle False, KillerAiState)
   where
     dist = lookAheadDistance
@@ -136,29 +176,42 @@ updateKillerAi ownSnake GameState{..} = case snakeNeck ownSnake of
     otherSnakeLineSegments = concatMap snakeLineSegments otherSnakes
 
     snakeLineSegments snake =
-        maybeToList (neckLookAhead dist <$> snakeNeck snake) ++
+        maybeToList (snakeLookAhead dist <$> makeDirSnake snake) ++
         snakeBodyToLineSegments (snakeBody snake)
 
-newtype Neck = Neck LineSegment
+    evaluateStrategy :: TurnStrategy -> DirSnake -> (Score, TurnStrategy)
+    evaluateStrategy ts ds@DirSnake {..} =
+        let turn    = dsDir + tsRelativeTurn ts
+            segment = LineSegment dsHead (dsHead + (angle turn .* dist)) in
+        (closestIntersection segment otherSnakeLineSegments, ts)
 
-snakeNeck :: Snake -> Maybe Neck
-snakeNeck snake = case Seq.viewl (snakeBody snake) of
+makeDirSnake :: Snake -> Maybe DirSnake
+makeDirSnake snake = case Seq.viewl (snakeBody snake) of
     Seq.EmptyL         -> Nothing
     head_ Seq.:< body1 -> case Seq.viewl body1 of
         Seq.EmptyL    -> Nothing
-        neck Seq.:< _ -> Just (Neck (LineSegment neck head_))
+        neck Seq.:< _ ->
+            let !dir = toAngle (head_ - neck) in
+            Just $! DirSnake head_ dir
 
-neckLookAhead :: Double -> Neck -> LineSegment
-neckLookAhead dist (Neck (LineSegment n h)) =
-    let offset = angle (toAngle $ h - n) .* dist in
-    LineSegment h (h + offset)
+snakeLookAhead :: Double -> DirSnake -> LineSegment
+snakeLookAhead dist (DirSnake head_ dir) =
+    let offset = angle dir .* dist in
+    LineSegment head_ (head_ + offset)
 
 closestIntersection :: LineSegment -> [LineSegment] -> Score
 closestIntersection travel@(LineSegment head_ _) =
     go NonIntersectingScore
   where
+    travelBox = lineSegmentToBox travel
+
+    quickIntersection segment =
+        if boxIntersection travelBox (lineSegmentToBox segment)
+            then lineSegmentIntersection travel segment
+            else NonIntersecting
+
     go acc [] = acc
-    go acc (segment : segments) = case lineSegmentIntersection travel segment of
+    go acc (segment : segments) = case quickIntersection segment of
         NonIntersecting -> go acc segments
         Parallel        -> go acc segments
         Colinear        -> go acc segments

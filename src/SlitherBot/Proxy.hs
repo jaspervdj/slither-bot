@@ -83,7 +83,7 @@ proxy serverPort = do
                 liftIO (WS.sendBinaryData serverConn (serializeClientMessage speedMsg))
                 t1 <- liftIO Criterion.Measurement.getTime
                 $logInfo ("AI took " ++ tshow (t1 - t0) ++ " seconds")
-                liftIO (threadDelay (250 * 1000 - round (max (t1 - t0) 0 * 1000000)))
+                liftIO (threadDelay (100 * 1000 - round (max (t1 - t0) 0 * 1000000)))
                 aiLoop (Just output)
               clientToServer = do
                 -- Foward the first message before starting AI
