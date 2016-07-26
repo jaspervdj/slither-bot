@@ -5,14 +5,16 @@ module SlitherBot.Ai.Killer
     , killerAi
     ) where
 
-import           Control.Monad            (guard)
-import           Data.Fixed               (mod')
-import qualified Data.Foldable            as Foldable
-import qualified Data.HashMap.Strict      as HMS
-import           Data.Maybe               (maybeToList)
-import           Data.Ord                 (Down (..))
-import qualified Data.Sequence            as Seq
-import qualified Linear.Metric            as Linear
+import           Control.Monad        (guard)
+import           Data.Fixed           (mod')
+import qualified Data.Foldable        as Foldable
+import qualified Data.HashMap.Strict  as HMS
+import           Data.List            (maximumBy)
+import           Data.Maybe           (mapMaybe, maybeToList)
+import           Data.Ord             (Down (..), comparing)
+import qualified Data.Sequence        as Seq
+import           Debug.Trace          (trace)
+import qualified Linear.Metric        as Linear
 import           Linear.V2
 import           SlitherBot.Ai
 import           SlitherBot.GameState
@@ -20,8 +22,9 @@ import           SlitherBot.Protocol
 
 --------------------------------------------------------------------------------
 
-newtype Radians = Radians {unRadians :: Double}
-    deriving (Eq, Ord, Show)
+newtype Radians = Radians {unRadians :: Double} deriving (Eq, Ord)
+
+instance Show Radians where show (Radians x) = show x
 
 clampRadians :: Double -> Double
 clampRadians r0 =
@@ -51,13 +54,19 @@ data DirSnake = DirSnake
     } deriving (Show)
 
 lookAheadDistance :: Double
-lookAheadDistance = 400
+lookAheadDistance = 1000
+
+enemyLookAhead :: Double
+enemyLookAhead = 100
 
 maxTurnAngle :: Double
 maxTurnAngle = pi / 4
 
 foodRadius :: Double
 foodRadius = 400
+
+killerBeamLength :: Double
+killerBeamLength = 1000
 
 data TurnStrategy
     = PlainTurn {tsRelativeTurn :: !Radians}
@@ -182,15 +191,15 @@ updateKillerAi ownSnake gs@GameState{..} = case makeDirSnake ownSnake of
     Nothing                      -> (AiOutput 0 False, KillerAiState)
     Just ds@(DirSnake _head_ dir) ->
         let nextSegments =
-                [ evaluateStrategy turn ds
+                [ (turn, evaluateStrategy turn ds)
                 | turn <- normalTurns ++ foodTurns ds gs
                 ] in
 
         case nextSegments of
             [] -> (AiOutput 0 False, KillerAiState)
             _  ->
-                let (_score, ts) = maximum nextSegments
-                    bestAngle    = dir + tsRelativeTurn ts in
+                let (ts, _)   = maximumBy (comparing snd) nextSegments
+                    bestAngle = dir + tsRelativeTurn ts in
                 (AiOutput (unRadians bestAngle) False, KillerAiState)
   where
     dist = lookAheadDistance
@@ -201,17 +210,21 @@ updateKillerAi ownSnake gs@GameState{..} = case makeDirSnake ownSnake of
         , Just snakeId /= gsOwnSnake
         ]
 
+    otherDirSnakes         = mapMaybe makeDirSnake otherSnakes
     otherSnakeLineSegments = concatMap snakeLineSegments otherSnakes
 
     snakeLineSegments snake =
-        maybeToList (snakeLookAhead dist <$> makeDirSnake snake) ++
+        maybeToList (snakeLookAhead enemyLookAhead <$> makeDirSnake snake) ++
         snakeBodyToLineSegments (snakeBody snake)
 
-    evaluateStrategy :: TurnStrategy -> DirSnake -> (Score, TurnStrategy)
-    evaluateStrategy ts DirSnake {..} =
+    evaluateStrategy
+        :: TurnStrategy -> DirSnake -> Double
+    evaluateStrategy ts ds@DirSnake {..} =
         let turn    = dsDir + tsRelativeTurn ts
-            segment = LineSegment dsHead (dsHead + (fromAngle turn .* dist)) in
-        (closestIntersection segment otherSnakeLineSegments, ts)
+            segment = LineSegment dsHead (dsHead + (fromAngle turn .* dist))
+            avoid   = closestIntersection segment otherSnakeLineSegments
+            killer  = killerBeamScores ds otherDirSnakes in
+        sumScores ts killer avoid
 
 makeDirSnake :: Snake -> Maybe DirSnake
 makeDirSnake snake = case Seq.viewl (snakeBody snake) of
@@ -227,9 +240,14 @@ snakeLookAhead dist (DirSnake head_ dir) =
     let offset = fromAngle dir .* dist in
     LineSegment head_ (head_ + offset)
 
-closestIntersection :: LineSegment -> [LineSegment] -> Score
+data AvoidScore
+    = AvoidedScore
+    | NotAvoidedScore !Double
+    deriving (Eq, Show)
+
+closestIntersection :: LineSegment -> [LineSegment] -> AvoidScore
 closestIntersection travel@(LineSegment head_ _) =
-    go NonIntersectingScore
+    go AvoidedScore
   where
     travelBox = lineSegmentToBox travel
 
@@ -243,16 +261,66 @@ closestIntersection travel@(LineSegment head_ _) =
         NonIntersecting -> go acc segments
         Parallel        -> go acc segments
         Colinear        -> go acc segments
-        Intersecting x  ->
-            go (min acc (IntersectingScore $ Linear.distance head_ x)) segments
+        Intersecting x  -> case acc of
+            AvoidedScore ->
+                go (NotAvoidedScore $ Linear.distance head_ x) segments
+            NotAvoidedScore dist ->
+                go (NotAvoidedScore $ min dist (Linear.distance head_ x))
+                    segments
 
-data Score
-    = NonIntersectingScore
-    | IntersectingScore !Double
-    deriving (Eq, Show)
+newtype KillerBeamScore = KillerBeamScore {unKillerBeamScore :: Double}
+    deriving (Show)
 
-instance Ord Score where
-    compare NonIntersectingScore  NonIntersectingScore  = EQ
-    compare NonIntersectingScore  _                     = GT
-    compare _                     NonIntersectingScore  = LT
-    compare (IntersectingScore x) (IntersectingScore y) = compare x y
+killerBeamScore :: DirSnake -> DirSnake -> KillerBeamScore
+killerBeamScore ourSnake theirSnake =
+    let ourHead   = dsHead ourSnake
+        theirHead = dsHead theirSnake
+        ourTgt    = ourHead   + fromAngle (dsDir ourSnake)   .* kbl
+        theirTgt  = theirHead + fromAngle (dsDir theirSnake) .* kbl
+        ourBeam   = LineSegment ourHead   ourTgt
+        theirBeam = LineSegment theirHead theirTgt in
+    case lineSegmentIntersection ourBeam theirBeam of
+        Intersecting point -> KillerBeamScore $!
+            let score = Linear.distance theirHead point -
+                        Linear.distance ourHead point
+
+                -- Lower points matter more!
+                penaltyFactor = if score < 0 then 2 else 1
+
+                -- Closer snakes matter more!
+                closeFactor = (100 / Linear.distance theirHead ourHead) in
+
+            score * penaltyFactor * closeFactor
+
+        _ -> KillerBeamScore 0
+  where
+    kbl = killerBeamLength
+
+killerBeamScores :: DirSnake -> [DirSnake] -> KillerBeamScore
+killerBeamScores ourSnake =
+    KillerBeamScore . sum . map (unKillerBeamScore . killerBeamScore ourSnake)
+
+sumScores
+    :: TurnStrategy
+    -> KillerBeamScore
+    -> AvoidScore
+    -> Double
+sumScores turnStategy killerBeam avoid =
+    let total = turnStrategyScore + killerBeamScore + avoidScore in
+    trace (show total ++
+        " (" ++ show (tsRelativeTurn turnStategy) ++
+        " turn: " ++ show turnStrategyScore ++
+        ", killer: " ++ show killerBeamScore ++
+        ", avoid: " ++ show avoidScore ++ ")") $
+        total
+  where
+    turnStrategyScore = case turnStategy of
+        PlainTurn _   -> 0
+        FoodTurn  _ v -> v  -- Food value, 1 to 50
+
+    killerBeamScore = case killerBeam of
+        KillerBeamScore v -> v
+
+    avoidScore = case avoid of
+        AvoidedScore         -> 0
+        NotAvoidedScore dist -> -dist * 10
