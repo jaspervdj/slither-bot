@@ -9,9 +9,8 @@ import           Control.Monad            (guard)
 import           Data.Fixed               (mod')
 import qualified Data.Foldable            as Foldable
 import qualified Data.HashMap.Strict      as HMS
-import           Data.List                (maximumBy)
 import           Data.Maybe               (maybeToList)
-import           Data.Ord                 (comparing, Down (..))
+import           Data.Ord                 (Down (..))
 import qualified Data.Sequence            as Seq
 import qualified Linear.Metric            as Linear
 import           Linear.V2
@@ -19,11 +18,36 @@ import           SlitherBot.Ai
 import           SlitherBot.GameState
 import           SlitherBot.Protocol
 
+--------------------------------------------------------------------------------
+
+newtype Radians = Radians {unRadians :: Double}
+    deriving (Eq, Ord, Show)
+
+clampRadians :: Double -> Double
+clampRadians r0 =
+    let r1 = r0 `mod'` (2 * pi) in
+    if r1 > pi then r1 - 2 * pi else r1
+
+instance Num Radians where
+    (Radians x) + (Radians y) = Radians (clampRadians $! x + y)
+    (Radians x) - (Radians y) = Radians (clampRadians $! x - y)
+    (Radians x) * (Radians y) = Radians (clampRadians $! x * y)
+
+    abs    (Radians x) = Radians (abs x)
+    signum (Radians x) = Radians (signum x)
+
+    fromInteger             = mkRadians . fromIntegral
+
+mkRadians :: Double -> Radians
+mkRadians = Radians . clampRadians
+
+--------------------------------------------------------------------------------
+
 data KillerAiState = KillerAiState
 
 data DirSnake = DirSnake
     { dsHead :: !(V2 Double)
-    , dsDir  :: !Double
+    , dsDir  :: !Radians
     } deriving (Show)
 
 lookAheadDistance :: Double
@@ -36,8 +60,8 @@ foodRadius :: Double
 foodRadius = 400
 
 data TurnStrategy
-    = PlainTurn {tsRelativeTurn :: !Double}
-    | FoodTurn  {tsRelativeTurn :: !Double, tsFood :: !Double}
+    = PlainTurn {tsRelativeTurn :: !Radians}
+    | FoodTurn  {tsRelativeTurn :: !Radians, tsFood :: !Double}
     deriving (Eq, Show)
 
 instance Ord TurnStrategy where
@@ -45,7 +69,7 @@ instance Ord TurnStrategy where
     compare (PlainTurn _)  (FoodTurn _ _) = LT
     compare (FoodTurn _ _) (PlainTurn _)  = GT
     compare (PlainTurn x)  (PlainTurn y)  =
-        -- Prefer going straight?
+        -- Prefer going straight?  This is broken with the Radians type.
         compare (Down $ abs x) (Down $ abs y)
 
 normalTurns :: [TurnStrategy]
@@ -54,7 +78,7 @@ normalTurns = map PlainTurn $
   where
     numTurns = 3 :: Int
     turns    =
-        [ fromIntegral ix * (maxTurnAngle / fromIntegral numTurns)
+        [ mkRadians $ fromIntegral ix * (maxTurnAngle / fromIntegral numTurns)
         | ix <- [1 .. numTurns]
         ]
 
@@ -62,10 +86,10 @@ foodTurns :: DirSnake -> GameState -> [TurnStrategy]
 foodTurns DirSnake {..} GameState {..} = do
     (foodPos, food) <- HMS.toList gsFoods
     guard $ Linear.distance dsHead foodPos < foodRadius
-    let turn         = toAngle (foodPos - dsHead)
-        relativeTurn = (turn - dsDir) `mod'` (2 * pi)
-    guard $ -maxTurnAngle <= relativeTurn && relativeTurn <= maxTurnAngle
-    return $ FoodTurn {tsRelativeTurn = relativeTurn, tsFood = foodValue food}
+    let turn                = toAngle (foodPos - dsHead)
+        relTurn@(Radians r) = turn - dsDir
+    guard $ -maxTurnAngle <= r && r <= maxTurnAngle
+    return $ FoodTurn {tsRelativeTurn = relTurn, tsFood = foodValue food}
 
 data LineSegment = LineSegment !(V2 Double) !(V2 Double)
     deriving (Show)
@@ -145,14 +169,18 @@ killerAi = Ai
     , aiHtmlStatus = mempty
     }
 
-toAngle :: V2 Double -> Double
-toAngle (V2 x y) = atan2 y x
+toAngle :: V2 Double -> Radians
+toAngle (V2 x y) = mkRadians $ atan2 y x
 {-# INLINE toAngle #-}
+
+fromAngle :: Radians -> V2 Double
+fromAngle (Radians r) = angle r
+{-# INLINE fromAngle #-}
 
 updateKillerAi :: Snake -> GameState -> (AiOutput, KillerAiState)
 updateKillerAi ownSnake gs@GameState{..} = case makeDirSnake ownSnake of
     Nothing                      -> (AiOutput 0 False, KillerAiState)
-    Just ds@(DirSnake head_ dir) ->
+    Just ds@(DirSnake _head_ dir) ->
         let nextSegments =
                 [ evaluateStrategy turn ds
                 | turn <- normalTurns ++ foodTurns ds gs
@@ -163,7 +191,7 @@ updateKillerAi ownSnake gs@GameState{..} = case makeDirSnake ownSnake of
             _  ->
                 let (_score, ts) = maximum nextSegments
                     bestAngle    = dir + tsRelativeTurn ts in
-                (AiOutput bestAngle False, KillerAiState)
+                (AiOutput (unRadians bestAngle) False, KillerAiState)
   where
     dist = lookAheadDistance
 
@@ -180,9 +208,9 @@ updateKillerAi ownSnake gs@GameState{..} = case makeDirSnake ownSnake of
         snakeBodyToLineSegments (snakeBody snake)
 
     evaluateStrategy :: TurnStrategy -> DirSnake -> (Score, TurnStrategy)
-    evaluateStrategy ts ds@DirSnake {..} =
+    evaluateStrategy ts DirSnake {..} =
         let turn    = dsDir + tsRelativeTurn ts
-            segment = LineSegment dsHead (dsHead + (angle turn .* dist)) in
+            segment = LineSegment dsHead (dsHead + (fromAngle turn .* dist)) in
         (closestIntersection segment otherSnakeLineSegments, ts)
 
 makeDirSnake :: Snake -> Maybe DirSnake
@@ -196,7 +224,7 @@ makeDirSnake snake = case Seq.viewl (snakeBody snake) of
 
 snakeLookAhead :: Double -> DirSnake -> LineSegment
 snakeLookAhead dist (DirSnake head_ dir) =
-    let offset = angle dir .* dist in
+    let offset = fromAngle dir .* dist in
     LineSegment head_ (head_ + offset)
 
 closestIntersection :: LineSegment -> [LineSegment] -> Score
